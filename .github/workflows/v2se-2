@@ -1,0 +1,119 @@
+// ===========================
+// 【1】加载影像和样本
+// ===========================
+
+// 研究区：南方地区的FeatureCollection
+var aoi = ee.FeatureCollection("projects/thesis-446007/assets/nanfang");
+
+// 训练样本数据，三个类别
+var pi = ee.FeatureCollection("projects/thesis-446007/assets/pi");
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");
+var ed = ee.FeatureCollection("projects/thesis-446007/assets/ed");
+
+// 将三个类别合并成一个总样本集
+var samples = pi.merge(hook).merge(ed);
+
+// Sentinel-2 SR影像
+var s2Collection = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(aoi)               // 只取研究区内的
+  .filterDate('2023-01-01', '2023-12-31')  // 时间段（你可以根据需要调整）
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))  // 云量过滤，保留晴天
+
+// 选择需要的波段
+var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12']; 
+var s2Filtered = s2Collection.select(bands);
+
+// 减少中位数计算的数据量：可以按一定间隔采样影像
+var sampledCollection = s2Filtered.filter(ee.Filter.calendarRange(1, 12, 'month')); // 按月采样
+var image = sampledCollection.median().clip(aoi);
+
+// ===========================
+// 【2】选择用于分类的波段
+// 这里的波段选择已在上面完成，此部分代码可省略
+// ===========================
+
+// ===========================
+// 【3】准备训练数据
+// ===========================
+
+// 对样本进行采样，减少样本数量
+var sampledSamples = samples.randomColumn('random').filter(ee.Filter.lt('random', 0.5));
+
+// 将样本点上的波段信息取出来，作为训练数据
+var training = image.select(bands).sampleRegions({
+  collection: sampledSamples,
+  properties: ['class'],  // 注意这里假设你的样本都有 'class' 属性表示类别
+  scale: 10   // Sentinel-2分辨率
+});
+
+// ===========================
+// 【4】划分训练集和验证集
+// ===========================
+
+// 随机划分70%做训练，30%做验证
+var withRandom = training.randomColumn('random');  // 添加一列随机数
+
+var trainSet = withRandom.filter(ee.Filter.lt('random', 0.8));
+var testSet = withRandom.filter(ee.Filter.gte('random', 0.8));
+
+// ===========================
+// 【5】训练随机森林分类器
+// ===========================
+
+// 根据实际情况调整树的数量
+var classifier = ee.Classifier.smileRandomForest(30)  // 随机森林，树数设30棵
+  .train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+// ===========================
+// 【6】应用分类器到影像
+// ===========================
+
+var classified = image.select(bands).classify(classifier);
+
+// ===========================
+// 【7】分类结果评估
+// ===========================
+
+// 预测验证集
+var test = testSet.classify(classifier);
+
+// 生成混淆矩阵
+var confusionMatrix = test.errorMatrix('class', 'classification');
+
+// 打印混淆矩阵、总体精度、Kappa系数
+print('Confusion Matrix:', confusionMatrix);
+print('Overall Accuracy:', confusionMatrix.accuracy());
+print('Kappa Coefficient:', confusionMatrix.kappa());
+
+// ===========================
+// 【8】可视化分类结果
+// ===========================
+
+// 设置每个类别的颜色（根据你的分类类别调整）
+var palette = [
+  '006400', // 类别1，比如松树林
+  '7FFFD4', // 类别2，比如阔叶林
+  'FFD700'  // 类别3，比如经济林
+];
+
+// 显示分类结果
+Map.centerObject(aoi, 8);
+Map.addLayer(classified.clip(aoi), {min: 0, max: 2, palette: palette}, 'Final Classification');
+
+// ===========================
+// 【9】（可选）导出分类结果
+// ===========================
+
+// Export.image.toDrive({
+//   image: classified.toByte(),
+//   description: 'Final_Tree_Species_Map',
+//   folder: 'GEE_Export',
+//   fileNamePrefix: 'tree_species_classification',
+//   region: aoi,
+//   scale: 10,
+//   maxPixels: 1e13
+// });    
