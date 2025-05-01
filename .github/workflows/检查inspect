@@ -1,0 +1,40 @@
+// 1. 加载所有数据
+var region = ee.FeatureCollection("projects/thesis-446007/assets/nanfang");
+var edulis = ee.FeatureCollection("projects/thesis-446007/assets/ed");
+var pinus = ee.FeatureCollection("projects/thesis-446007/assets/pi");
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");
+
+// 2. 为每个树种添加class标签（毛竹=1，马尾松=2，杉木=3）
+var edulis_labeled = edulis.map(function(f) {return f.set('class', 1)});
+var pinus_labeled = pinus.map(function(f) {return f.set('class', 2)});
+var hook_labeled = hook.map(function(f) {return f.set('class', 3)});
+
+// 3. 合并所有样本
+var all_samples = edulis_labeled
+  .merge(pinus_labeled)
+  .merge(hook_labeled);
+
+// 4. 样本数量统计
+print('毛竹样本数:', edulis.size());
+print('马尾松样本数:', pinus.size());
+print('杉木样本数:', hook.size());
+print('总样本数:', all_samples.size());
+
+// 5. 可视化检查（在地图面板显示）
+Map.centerObject(region, 8);  // 缩放到研究区
+Map.addLayer(region, {color: 'gray'}, '研究区边界');
+Map.addLayer(edulis_labeled.draw({color: '00FF00', pointRadius: 3}), {}, '毛竹样本');
+Map.addLayer(pinus_labeled.draw({color: 'FF0000', pointRadius: 3}), {}, '马尾松样本');
+Map.addLayer(hook_labeled.draw({color: '0000FF', pointRadius: 3}), {}, '杉木样本');
+
+// 6. 检查样本是否在研究区内（重要！）
+var samples_clipped = all_samples.filterBounds(region);
+print('研究区内的有效样本数:', samples_clipped.size());
+
+// 7. 数据平衡建议（如果样本量差异大）
+var min_count = ee.List([
+  edulis.size(), 
+  pinus.size(), 
+  hook.size()
+]).reduce(ee.Reducer.min());
+print('建议每个类别的最大样本数:', min_count);
