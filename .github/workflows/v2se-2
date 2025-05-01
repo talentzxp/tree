@@ -11,7 +11,20 @@ var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");
 var ed = ee.FeatureCollection("projects/thesis-446007/assets/ed");
 
 // 将三个类别合并成一个总样本集
-var samples = pi.merge(hook).merge(ed);
+// 为每类样本添加数值型类别标签
+var hook_labeled = hook.map(function(f) {
+  return f.set('class', 0); // 杉木类
+});
+var ed_labeled = ed.map(function(f) {
+  return f.set('class', 1); // 毛竹类
+});
+var pi_labeled = pi.map(function(f) {
+  return f.set('class', 2); // 马尾松类
+});
+
+// 合并带有数值标签的样本
+var samples = pi_labeled.merge(hook_labeled).merge(ed_labeled);
+
 
 // Sentinel-2 SR影像
 var s2Collection = ee.ImageCollection('COPERNICUS/S2_SR')
