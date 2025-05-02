@@ -1,0 +1,173 @@
+// -------------------------- 数据导入 --------------------------
+var region = ee.FeatureCollection("projects/thesis-446007/assets/n");
+var edulis = ee.FeatureCollection("projects/thesis-446007/assets/ed");
+var pinus = ee.FeatureCollection("projects/thesis-446007/assets/pi");
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");
+
+var startDate = '2023-06-01';
+var endDate = '2023-12-31';
+
+// 适用于 COPERNICUS/S2_SR 的云掩膜函数
+var maskS2clouds = function(image) {
+  var scl = image.select('SCL');
+
+  // 定义云、云影、积云、高云
+  var cloudShadow = scl.eq(3); // 云阴影
+  var clouds = scl.eq(8);      // 中概率云
+  var highClouds = scl.eq(9);  // 高概率云
+  var cirrus = scl.eq(10);     // 卷云
+
+  // 把这些掩膜掉（即不保留）
+  var mask = cloudShadow.or(clouds).or(highClouds).or(cirrus).not();
+
+  // 应用掩膜
+  return image.updateMask(mask);
+};
+
+// -------------------------- Sentinel-2 处理 --------------------------
+var S2_SR = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(region)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(maskS2clouds);
+
+// 对影像集合进行采样，减少计算量
+// var S2_sampled = S2_SR.filter(ee.Filter.calendarRange(1, 12, 'month'));
+var S2_sampled = S2_SR; // 去掉calendarRange筛选
+
+// 选择需要的波段
+var selectedBands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'];
+var S2_SR_selected = S2_sampled.select(selectedBands);
+
+var s2_median = S2_SR_selected.median();
+
+// -------------------------- Landsat-8 处理 --------------------------
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+  .filterBounds(region)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUD_COVER', 20))
+  .map(function(img) {
+    // L2数据需要做大气校正反射率
+    var opticalBands = img.select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5'])
+      .multiply(0.0000275).add(-0.2)
+      .rename(['B2_L8', 'B3_L8', 'B4_L8', 'B5_L8']);
+    var ndvi = opticalBands.normalizedDifference(['B5_L8', 'B4_L8']).rename('NDVI_L8');
+    var evi = img.expression(
+      '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+        'NIR': opticalBands.select('B5_L8'),
+        'RED': opticalBands.select('B4_L8'),
+        'BLUE': opticalBands.select('B2_L8')
+      }).rename('EVI_L8');
+    return opticalBands.addBands([ndvi, evi]);
+  });
+
+// 对 Landsat-8 影像集合进行采样
+// var l8_sampled = l8.filter(ee.Filter.calendarRange(1, 12, 'month'));
+var l8_sampled = l8; // 去掉calendarRange筛选
+var l8_median = l8_sampled.median();
+
+// -------------------------- 地形数据处理 --------------------------
+var dem = ee.Image("USGS/SRTMGL1_003").clip(region);
+var slope = ee.Terrain.slope(dem).rename('slope');
+var aspect = ee.Terrain.aspect(dem).rename('aspect');
+var elevation = dem.rename('elevation');
+
+// -------------------------- GEDI冠层高度处理 --------------------------
+// 使用GEDI L2A产品 - 正确的数据集
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+  .filterBounds(region)
+  .filterDate(startDate, endDate);
+
+// 选择rh100最大值波段（最高冠层高度）
+var gedi_raster = gedi.select('rh100').median().rename('gedi_rh100');
+
+// 缩放到60m以匹配 Landsat 分辨率（这里将分辨率降低为60）
+gedi_raster = gedi_raster
+  .reproject({ crs: 'EPSG:4326', scale: 120 });
+
+// -------------------------- 合并所有特征 --------------------------
+var composite = s2_median
+  .addBands(l8_median)
+  .addBands([slope, aspect, elevation])
+  .addBands(gedi_raster);
+
+// 去除复合影像的掩膜
+composite = composite.unmask();
+
+// -------------------------- 样本准备 --------------------------
+var edulis_sample = edulis.map(function(f) { return f.set('class', 2); });
+var pinus_sample = pinus.map(function(f) { return f.set('class', 0); });
+var hook_sample = hook.map(function(f) { return f.set('class', 1); });
+
+// 对样本进行采样，进一步降低采样比例
+var sampled_edulis = edulis_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
+var sampled_pinus = pinus_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
+var sampled_hook = hook_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
+
+// 合并所有样本
+var all_samples = sampled_edulis.merge(sampled_pinus).merge(sampled_hook);
+
+// 检查样本集合大小
+var sampleSize = all_samples.size();
+print('All Samples Size:', sampleSize);
+
+// 打印样本集合和复合影像的边界
+print('All Samples Bounds:', all_samples.geometry().bounds());
+print('Composite Bounds:', composite.geometry().bounds());
+
+if (sampleSize.gt(0).getInfo()) {
+  // -------------------------- 提取样本特征 --------------------------
+  var training = composite.sampleRegions({
+    collection: all_samples,
+    properties: ['class'],
+    scale: 120, // 将这里的scale也改为60，与前面的分辨率保持一致
+    tileScale: 4
+  });
+
+  // 检查训练数据大小
+  var trainingSize = training.size();
+  print('Training Data Size:', trainingSize);
+
+  if (trainingSize.gt(0).getInfo()) {
+    // 检查训练数据中的类别数量
+    var classValues = training.aggregate_array('class').distinct();
+    var classCount = classValues.size();
+    print('Number of Classes in Training Data:', classCount);
+
+    if (classCount.gt(1).getInfo()) {
+      // -------------------------- 训练随机森林分类器 --------------------------
+      // 调整随机森林的树数量
+      var classifier = ee.Classifier.smileRandomForest(50).train({
+        features: training,
+        classProperty: 'class',
+        inputProperties: composite.bandNames()
+      });
+
+      // -------------------------- 进行分类 --------------------------
+      var classified = composite.classify(classifier);
+
+      // -------------------------- 可视化分类结果 --------------------------
+      var palette = ['#1f9e89', '#d1495b', '#66c2a5']; // 可改
+      Map.addLayer(classified.clip(region), { min: 0, max: 2, palette: palette }, 'Tree Species Map');
+
+      // -------------------------- 精度评估 --------------------------
+      var validation = composite.sampleRegions({
+        collection: all_samples,
+        properties: ['class'],
+        scale: 120, // 将这里的scale也改为60
+        tileScale: 4
+      });
+      var validated = validation.classify(classifier);
+      var errorMatrix = validated.errorMatrix('class', 'classification');
+      print('Confusion Matrix:', errorMatrix);
+      print('Overall Accuracy:', errorMatrix.accuracy());
+      print('Kappa Coefficient:', errorMatrix.kappa());
+    } else {
+      print('Not enough classes in training data. At least two classes are required.');
+    }
+  } else {
+    print('No valid training data were found.');
+  }
+} else {
+  print('No valid samples were found after sampling.');
+}
