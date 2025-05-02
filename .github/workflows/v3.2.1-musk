@@ -102,7 +102,7 @@ var pinus_sample = pinus.map(function(f) { return f.set('class', 0); });
 var hook_sample = hook.map(function(f) { return f.set('class', 1); });
 var oil_sample = oil.map(function(f) { return f.set('class', 3); }); 
 
-// 对样本进行采样，进一步降低采样比例
+// 对样本进行采样，此处调整采样比例，0.1-1.0
 var sampled_edulis = edulis_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
 var sampled_pinus = pinus_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
 var sampled_hook = hook_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.1));
