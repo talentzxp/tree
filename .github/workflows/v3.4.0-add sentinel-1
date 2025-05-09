@@ -1,4 +1,3 @@
-// 加入时间序列
 // -------------------------- 数据导入 --------------------------
 var region = ee.FeatureCollection("projects/thesis-446007/assets/n");
 var edulis = ee.FeatureCollection("projects/thesis-446007/assets/phy");
@@ -127,15 +126,15 @@ for (var year = startYear; year <= endYear; year++) {
 
   // -------------------------- 样本准备 --------------------------
   var edulis_sample = edulis.map(function(f) { return f.set('class', 2); });
-  var pinus_sample = pinus.map(function(f) { return f.set('class', 0); });
+  var pinus_sample = pinus.map(function(f) { return f.set('class', 4); }); // 将松树类别从0改为4
   var hook_sample = hook.map(function(f) { return f.set('class', 1); });
   var oil_sample = oil.map(function(f) { return f.set('class', 3); }); 
 
   // 对样本进行采样，此处调整采样比例，0.1-1.0
-  var sampled_edulis = edulis_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.5));
-  var sampled_pinus = pinus_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.5));
-  var sampled_hook = hook_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.5));
-  var sampled_oil = oil_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.5)); 
+  var sampled_edulis = edulis_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.7));
+  var sampled_pinus = pinus_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.7));
+  var sampled_hook = hook_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.7));
+  var sampled_oil = oil_sample.randomColumn('random').filter(ee.Filter.lt('random', 0.7)); 
 
   // 合并所有样本
   var all_samples = sampled_edulis.merge(sampled_pinus).merge(sampled_hook).merge(sampled_oil);
@@ -181,19 +180,20 @@ for (var year = startYear; year <= endYear; year++) {
 
         // 添加一个新的波段来标记是否为已知的四个物种，不是则设为一个特殊值（这里设为 -1 表示空白）
         var isKnownSpecies = classified.expression(
-          "(classification == 0 || classification == 1 || classification == 2 || classification == 3)? classification : -1",
+          "(classification == 1 || classification == 2 || classification == 3 || classification == 4)? classification : -1",
           {
             "classification": classified.select('classification')
           }
         ).rename('classification_with_unknown');
 
-        // 使用 JRC/GFC2020_subtypes/V0 数据集进行验证，如果是非人工林，则都输出为白色
+        // 使用 JRC/GFC2020_subtypes/V0 数据集进行验证，如果是非人工林，则都输出为0
         var forestTypes = ee.ImageCollection("JRC/GFC2020_subtypes/V0").mosaic();
         var nonPlantationMask = forestTypes.neq(20); // 创建非人工林的掩码
-        var finalClassification = isKnownSpecies.where(nonPlantationMask, 4); // 将非人工林地区的分类值设为4
+        var finalClassification = isKnownSpecies.where(nonPlantationMask, 0); // 将非人工林地区的分类值设为0
 
         // 使用新的波段进行可视化
-        var palette = ['#1f9e89', '#d1495b', '#66c2a5', '#FFA500', 'white']; // 添加白色表示非人工林区域
+        // 调整颜色映射，将类别4的颜色设为之前类别0的颜色
+        var palette = ['white', '#d1495b', '#66c2a5', '#FFA500', '#1f9e89']; 
         Map.addLayer(finalClassification.clip(region), { min: -1, max: 4, palette: palette }, 'Tree Species Map for year ' + year);
 
         // -------------------------- 精度评估 --------------------------
