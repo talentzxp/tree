@@ -1,0 +1,184 @@
+// -------------------------- 数据导入 --------------------------
+var region = ee.FeatureCollection("projects/thesis-446007/assets/n");
+var edulis = ee.FeatureCollection("projects/thesis-446007/assets/phy");
+var pinus = ee.FeatureCollection("projects/thesis-446007/assets/pi");
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");
+var oil = ee.FeatureCollection("projects/thesis-446007/assets/oil"); 
+
+// -------------------------- 云掩膜函数 --------------------------
+var maskS2clouds = function(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+  return image.updateMask(mask);
+};
+
+// -------------------------- Sentinel-1 处理函数 --------------------------
+var processSentinel1 = function(startDate, endDate, region) {
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'));
+  var vv = s1.select('VV').median().rename('VV');
+  var vh = s1.select('VH').median().rename('VH');
+  var ratio = vv.divide(vh).rename('VV_VH_ratio');
+  return ee.Image.cat([vv, vh, ratio]);
+};
+
+// -------------------------- 主处理函数 --------------------------
+var processYear = function(year) {
+  year = ee.Number(year);
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  // Sentinel-2
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+    .median();
+
+  // Landsat-8
+  var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUD_COVER', 20))
+    .map(function(img) {
+      var bands = img.select(['SR_B2','SR_B3','SR_B4','SR_B5'])
+        .multiply(0.0000275).add(-0.2)
+        .rename(['B2_L8','B3_L8','B4_L8','B5_L8']);
+      var ndvi = bands.normalizedDifference(['B5_L8','B4_L8']).rename('NDVI_L8');
+      var evi = img.expression('2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+        'NIR': bands.select('B5_L8'),
+        'RED': bands.select('B4_L8'),
+        'BLUE': bands.select('B2_L8')
+      }).rename('EVI_L8');
+      return bands.addBands([ndvi, evi]);
+    }).median();
+
+  // DEM
+  var dem = ee.Image('USGS/SRTMGL1_003').clip(region);
+  var slope = ee.Terrain.slope(dem).rename('slope');
+  var aspect = ee.Terrain.aspect(dem).rename('aspect');
+  var elevation = dem.rename('elevation');
+
+  // GEDI
+  var gedi = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .select('rh100').median().rename('gedi_rh100')
+    .reproject({crs:'EPSG:4326', scale: 120});
+
+  // Sentinel-1
+  var s1 = processSentinel1(startDate, endDate, region);
+
+  // 合并特征
+  var composite = s2.addBands(l8)
+    .addBands([slope, aspect, elevation])
+    .addBands(gedi)
+    .addBands(s1)
+    .unmask();
+
+  // 样本构建
+  var samples = edulis.map(function(f){ return f.set('class', 2); })
+    .merge(pinus.map(function(f){ return f.set('class', 4); }))
+    .merge(hook.map(function(f){ return f.set('class', 1); }))
+    .merge(oil.map(function(f){ return f.set('class', 3); }))
+    .randomColumn('random')
+    .filter(ee.Filter.lt('random', 0.7));
+
+  var training = composite.sampleRegions({
+    collection: samples,
+    properties: ['class'],
+    scale: 120,
+    tileScale: 4
+  });
+
+  // 训练样本是否足够
+  var classCount = training.aggregate_array('class').distinct().size();
+  var condition = classCount.gte(2);
+
+  // 主体流程
+  var result = ee.Algorithms.If(condition, (function() {
+    var classifier = ee.Classifier.smileRandomForest(500)
+      .train({
+        features: training,
+        classProperty: 'class',
+        inputProperties: composite.bandNames()
+      });
+
+    var classified = composite.classify(classifier);
+
+    var speciesMap = classified.expression(
+      "(classification == 1 || classification == 2 || classification == 3 || classification == 4) ? classification : -1",
+      { classification: classified }
+    ).rename('classification_with_unknown');
+
+    var finalMap = speciesMap; // 👈 直接使用分类结果
+    // 显示图层
+    Map.addLayer(finalMap, {min: -1, max: 4, palette: ['white','#d1495b','#66c2a5','#FFA500','#1f9e89']}, 'Year ' + year);
+
+    // 精度评估
+    var validated = composite.sampleRegions({
+      collection: samples,
+      properties: ['class'],
+      scale: 120,
+      tileScale: 4
+    }).classify(classifier);
+
+    var ematrix = validated.errorMatrix('class', 'classification');
+    print('Year ' + year + ' Confusion Matrix:', ematrix);
+    print('Year ' + year + ' Accuracy:', ematrix.accuracy());
+    print('Year ' + year + ' Kappa:', ematrix.kappa());
+
+    // 特征重要性
+    var importances = ee.Dictionary(classifier.explain().get('importance'));
+    print('Year ' + year + ' Feature Importances:', importances);
+
+    // 导出分类图像
+    Export.image.toDrive({
+      image: finalMap.toInt8(),
+      description: 'Classification_' + year.format(),
+      folder: 'Plantation_Classification',
+      fileNamePrefix: 'classification_' + year.format(),
+      region: region.geometry(),
+      scale: 30,
+      maxPixels: 1e13
+    });
+
+    // 导出精度矩阵CSV
+    Export.table.toDrive({
+      collection: validated,
+      description: 'Validation_' + year.format(),
+      folder: 'Plantation_Validation',
+      fileNamePrefix: 'validation_' + year.format(),
+      fileFormat: 'CSV'
+    });
+
+    // 导出特征重要性
+    var importanceTable = importances.keys().map(function(k){
+      return ee.Feature(null, {
+        'feature': k,
+        'importance': importances.get(k)
+      });
+    });
+    Export.table.toDrive({
+      collection: ee.FeatureCollection(importanceTable),
+      description: 'Importance_' + year.format(),
+      folder: 'Plantation_Importance',
+      fileNamePrefix: 'importance_' + year.format(),
+      fileFormat: 'CSV'
+    });
+
+    return null; // dummy return
+  })(), print('Year ' + year + ': Not enough classes for training.'));
+};
+
+// -------------------------- 调用年份处理 --------------------------
+for (var year = 2019; year <= 2023; year++) {
+  processYear(year);
+}
+
