@@ -289,7 +289,7 @@ legend.add(makeRow('#FF8C00', '油茶'));
 legend.add(makeRow('#006400', '马尾松'));
 
 Map.add(legend);
-
+//———————————以下会报错————————————
 // 人工林对自然林的入侵分析
 // 假设人工林为杉木和油茶，自然林为马尾松
 var plantation = hook.merge(oil);
