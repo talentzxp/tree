@@ -1,0 +1,366 @@
+// -------------------------- 数据导入 --------------------------
+var region = ee.FeatureCollection("projects/thesis-446007/assets/n");//研究区
+var edulis = ee.FeatureCollection("projects/thesis-446007/assets/phy");  // 毛竹
+var pinus = ee.FeatureCollection("projects/thesis-446007/assets/pi");  // 马尾松
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook");  // 杉木
+var oil = ee.FeatureCollection("projects/thesis-446007/assets/oil");  // 油茶
+
+// -------------------------- 云掩膜函数 --------------------------
+var maskS2clouds = function(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+  return image.updateMask(mask);
+};
+
+// -------------------------- Sentinel-1 处理函数 --------------------------
+var processSentinel1 = function(startDate, endDate, region) {
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'));
+  var vv = s1.select('VV').median().rename('VV');
+  var vh = s1.select('VH').median().rename('VH');
+  var ratio = vv.divide(vh).rename('VV_VH_ratio');
+  return ee.Image.cat([vv, vh, ratio]);
+};
+
+// -------------------------- 主处理函数 --------------------------
+var processYear = function(year) {
+  year = ee.Number(year);
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  // Sentinel-2
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+    .median();
+
+  // Landsat-8
+  var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUD_COVER', 20))
+    .map(function(img) {
+      var bands = img.select(['SR_B2','SR_B3','SR_B4','SR_B5'])
+        .multiply(0.0000275).add(-0.2)
+        .rename(['B2_L8','B3_L8','B4_L8','B5_L8']);
+      var ndvi = bands.normalizedDifference(['B5_L8','B4_L8']).rename('NDVI_L8');
+      var evi = img.expression('2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+        'NIR': bands.select('B5_L8'),
+        'RED': bands.select('B4_L8'),
+        'BLUE': bands.select('B2_L8')
+      }).rename('EVI_L8');
+      return bands.addBands([ndvi, evi]);
+    }).median();
+
+  // 计算NDVI时间序列特征
+  var ndviTimeSeries = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
+    .map(maskS2clouds)
+    .select(['B8', 'B4'])
+    .map(function(img) {
+      var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+      return ndvi.set('system:time_start', img.get('system:time_start'));
+    });
+  
+  // 计算NDVI的最大值、最小值和平均值
+  var ndviMax = ndviTimeSeries.max().rename('NDVI_max');
+  var ndviMin = ndviTimeSeries.min().rename('NDVI_min');
+  var ndviMean = ndviTimeSeries.mean().rename('NDVI_mean');
+  var ndviStdDev = ndviTimeSeries.reduce(ee.Reducer.stdDev()).rename('NDVI_stdDev');
+  
+  // 计算NDVI的振幅（最大值减去最小值）
+  var ndviAmplitude = ndviMax.subtract(ndviMin).rename('NDVI_amplitude');
+  
+  // DEM
+  var dem = ee.Image('USGS/SRTMGL1_003').clip(region);
+  var slope = ee.Terrain.slope(dem).rename('slope');
+  var aspect = ee.Terrain.aspect(dem).rename('aspect');
+  var elevation = dem.rename('elevation');
+
+  // GEDI
+  var gedi = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .select('rh100').median().rename('gedi_rh100')
+    .reproject({crs:'EPSG:4326', scale: 120});
+
+  // Sentinel-1
+  var s1 = processSentinel1(startDate, endDate, region);
+
+  // 合并特征
+  var composite = s2.addBands(l8)
+    .addBands([slope, aspect, elevation])
+    .addBands(gedi)
+    .addBands(s1)
+    .addBands([ndviMax, ndviMin, ndviMean, ndviStdDev, ndviAmplitude])  // 添加NDVI时间序列特征
+    .unmask();
+
+  // 样本构建 - 重新分配类别编码
+  // 1: 杉木(Chinese Fir), 2: 毛竹(Bamboo), 3: 油茶(Camellia), 4: 马尾松(Masson Pine)
+  var samples = hook.map(function(f){ return f.set('class', 1); })
+    .merge(edulis.map(function(f){ return f.set('class', 2); }))
+    .merge(oil.map(function(f){ return f.set('class', 3); }))
+    .merge(pinus.map(function(f){ return f.set('class', 4); }))
+    .randomColumn('random')
+    .filter(ee.Filter.lt('random', 0.7));
+
+  var training = composite.sampleRegions({
+    collection: samples,
+    properties: ['class'],
+    scale: 120,
+    tileScale: 4
+  });
+
+  // 训练样本是否足够
+  var classCount = training.aggregate_array('class').distinct().size();
+  var condition = classCount.gte(2);
+
+  // 主体流程
+  var result = ee.Algorithms.If(condition, (function() {
+    // 使用更复杂的分类器，增加树的数量
+    var classifier = ee.Classifier.smileRandomForest(1000)
+      .train({
+        features: training,
+        classProperty: 'class',
+        inputProperties: composite.bandNames()
+      });
+
+    var classified = composite.classify(classifier);
+
+    var speciesMap = classified.expression(
+      "(classification == 1 || classification == 2 || classification == 3 || classification == 4) ? classification : -1",
+      { classification: classified }
+    ).rename('classification_with_unknown');
+
+    var finalMap = speciesMap;
+    
+    // 为不同植被类型设置更合适的颜色
+    var vegetationPalette = [
+      'white',    // -1: 未知
+      '#228B22',  // 1: 杉木(深绿色)
+      '#90EE90',  // 2: 毛竹(浅绿色)
+      '#FF8C00',  // 3: 油茶(橙色)
+      '#006400'   // 4: 马尾松(暗绿色)
+    ];
+    
+    // 显示图层
+    Map.addLayer(finalMap, {min: -1, max: 4, palette: vegetationPalette}, 'Year'+ year);
+
+    // 精度评估
+    var validated = composite.sampleRegions({
+      collection: samples,
+      properties: ['class'],
+      scale: 120,
+      tileScale: 4
+    }).classify(classifier);
+
+    var ematrix = validated.errorMatrix('class', 'classification');
+    print('Year'+ year +'Confusion Matrix:', ematrix);
+    print('Year'+ year +'Accuracy:', ematrix.accuracy());
+    print('Year'+ year +'Kappa:', ematrix.kappa());
+    
+    // 按类别计算精度指标
+    var producersAccuracy = ematrix.producersAccuracy();
+    var usersAccuracy = ematrix.consumersAccuracy();
+    print('Year'+ year +'Producers Accuracy:', producersAccuracy);
+    print('Year'+ year +'Users Accuracy:', usersAccuracy);
+
+    // 特征重要性
+    var importances = ee.Dictionary(classifier.explain().get('importance'));
+    print('Year'+ year +'Feature Importances:', importances);
+
+    // 导出分类图像
+    Export.image.toDrive({
+      image: finalMap.toInt8(),
+      description: 'Vegetation_Classification_' + year.format(),
+      folder: 'Vegetation_Classification',
+      fileNamePrefix: 'vegetation_classification_' + year.format(),
+      region: region.geometry(),
+      scale: 30,
+      maxPixels: 1e13
+    });
+
+    // 导出精度矩阵CSV
+    Export.table.toDrive({
+      collection: validated,
+      description: 'Validation_' + year.format(),
+      folder: 'Vegetation_Validation',
+      fileNamePrefix: 'validation_' + year.format(),
+      fileFormat: 'CSV'
+    });
+
+    // 导出特征重要性
+    var importanceTable = importances.keys().map(function(k){
+      return ee.Feature(null, {
+        'feature': k,
+        'importance': importances.get(k)
+      });
+    });
+    Export.table.toDrive({
+      collection: ee.FeatureCollection(importanceTable),
+      description: 'Importance_' + year.format(),
+      folder: 'Vegetation_Importance',
+      fileNamePrefix: 'importance_' + year.format(),
+      fileFormat: 'CSV'
+    });
+
+    // 导出分类结果为KML
+    Export.table.toDrive({
+      collection: finalMap.reduceToVectors({
+        geometry: region,
+        crs: finalMap.projection(),
+        scale: 30,
+        geometryType: 'polygon',
+        eightConnected: false,
+        labelProperty: 'classification_with_unknown',
+        reducer: ee.Reducer.mean(),
+        maxPixels: 1e13
+      }),
+      description: 'Vegetation_Map_' + year.format(),
+      folder: 'Vegetation_Map',
+      fileNamePrefix: 'vegetation_map_' + year.format(),
+      fileFormat: 'KML'
+    });
+
+    return null; // dummy return
+  })(), print('Year'+ year + ': Not enough classes for training.'));
+};
+
+// -------------------------- 调用年份处理 --------------------------
+for (var year = 2019; year <= 2023; year++) {
+  processYear(year);
+}
+
+// 添加图例
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: '植被分类',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legend.add(legendTitle);
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  
+  var description = ui.Label({
+    value: name,
+    style: {
+      margin: '0 0 4px 6px'
+    }
+  });
+  
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+};
+
+// 为图例添加类别
+legend.add(makeRow('white', '未知'));
+legend.add(makeRow('#228B22', '杉木'));
+legend.add(makeRow('#90EE90', '毛竹'));
+legend.add(makeRow('#FF8C00', '油茶'));
+legend.add(makeRow('#006400', '马尾松'));
+
+Map.add(legend);
+
+// 人工林对自然林的入侵分析
+// 假设人工林为杉木和油茶，自然林为马尾松
+var plantation = hook.merge(oil);
+var naturalForest = pinus;
+
+// 计算每年人工林和自然林的面积
+var plantationAreaSeries = [];
+var naturalForestAreaSeries = [];
+for (var year = 2019; year <= 2023; year++) {
+  var classification = processYear(year);
+  var plantationMask = classification.select('classification_with_unknown').eq(1).or(classification.select('classification_with_unknown').eq(3));
+  var naturalForestMask = classification.select('classification_with_unknown').eq(4);
+  
+  var plantationArea = plantationMask.multiply(ee.Image.pixelArea()).divide(1e6).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('classification_with_unknown');
+  
+  var naturalForestArea = naturalForestMask.multiply(ee.Image.pixelArea()).divide(1e6).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('classification_with_unknown');
+  
+  plantationAreaSeries.push(ee.Feature(null, {year: year, area: plantationArea}));
+  naturalForestAreaSeries.push(ee.Feature(null, {year: year, area: naturalForestArea}));
+}
+
+plantationAreaSeries = ee.FeatureCollection(plantationAreaSeries);
+naturalForestAreaSeries = ee.FeatureCollection(naturalForestAreaSeries);
+
+// 计算人工林面积变化趋势
+var plantationAreaChart = ui.Chart.feature.byFeature(plantationAreaSeries, 'year', 'area')
+  .setChartType('LineChart')
+  .setOptions({
+    title: '2019 - 2023年人工林面积变化',
+    hAxis: {title: '年份'},
+    vAxis: {title: '面积(km²)'},
+    lineWidth: 2
+  });
+print(plantationAreaChart);
+
+// 计算自然林面积变化趋势
+var naturalForestAreaChart = ui.Chart.feature.byFeature(naturalForestAreaSeries, 'year', 'area')
+  .setChartType('LineChart')
+  .setOptions({
+    title: '2019 - 2023年自然林面积变化',
+    hAxis: {title: '年份'},
+    vAxis: {title: '面积(km²)'},
+    lineWidth: 2
+  });
+print(naturalForestAreaChart);
+
+// 计算人工林对自然林的侵占面积
+var invasionAreas = [];
+for (var year = 2019; year < 2023; year++) {
+  var currentYearPlantation = plantationAreaSeries.filter(ee.Filter.eq('year', year)).first().get('area');
+  var nextYearPlantation = plantationAreaSeries.filter(ee.Filter.eq('year', year + 1)).first().get('area');
+  var currentYearNaturalForest = naturalForestAreaSeries.filter(ee.Filter.eq('year', year)).first().get('area');
+  var nextYearNaturalForest = naturalForestAreaSeries.filter(ee.Filter.eq('year', year + 1)).first().get('area');
+  
+  var invasionArea = ee.Number(nextYearPlantation).subtract(currentYearPlantation).subtract(ee.Number(nextYearNaturalForest).subtract(currentYearNaturalForest));
+  invasionAreas.push(ee.Feature(null, {year: year, invasionArea: invasionArea}));
+}
+
+invasionAreas = ee.FeatureCollection(invasionAreas);
+
+// 绘制人工林对自然林的侵占面积图
+var invasionAreaChart = ui.Chart.feature.byFeature(invasionAreas, 'year', 'invasionArea')
+  .setChartType('BarChart')
+
