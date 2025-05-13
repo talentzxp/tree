@@ -1,0 +1,175 @@
+// -------------------- 用户输入区域 --------------------
+var region = ee.FeatureCollection("projects/thesis-446007/assets/n");
+var edulis = ee.FeatureCollection("projects/thesis-446007/assets/phy").map(function(f) {
+  return f.set('class', 'edulis');
+});
+var pinus = ee.FeatureCollection("projects/thesis-446007/assets/pin").map(function(f) {
+  return f.set('class', 'pinus');
+});
+var hook = ee.FeatureCollection("projects/thesis-446007/assets/hook").map(function(f) {
+  return f.set('class', 'hook');
+});
+var oil = ee.FeatureCollection("projects/thesis-446007/assets/oil").map(function(f) {
+  return f.set('class', 'oil');
+});
+var allSamples = edulis.merge(pinus).merge(hook).merge(oil);
+
+// 定义年份范围
+var startYear = 2019;
+var endYear = 2023;
+
+// -------------------- 掩膜函数 --------------------
+var maskS2clouds = function(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+  return image.updateMask(mask);
+};
+
+// Sentinel-1 极化特征函数 - 增强版
+function getS1(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = ee.Date.fromYMD(year, 12, 31);
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(region)
+    .filterDate(start, end)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
+    
+  // 计算多种统计量
+  var vv_mean = s1.select('VV').mean().rename('VV_mean');
+  var vv_median = s1.select('VV').median().rename('VV_median');
+  var vv_stdDev = s1.select('VV').reduce(ee.Reducer.stdDev()).rename('VV_stdDev');
+  
+  var vh_mean = s1.select('VH').mean().rename('VH_mean');
+  var vh_median = s1.select('VH').median().rename('VH_median');
+  var vh_stdDev = s1.select('VH').reduce(ee.Reducer.stdDev()).rename('VH_stdDev');
+  
+  // 计算比值
+  var ratio_mean = vv_mean.divide(vh_mean).rename('VV_VH_ratio_mean');
+  var ratio_median = vv_median.divide(vh_median).rename('VV_VH_ratio_median');
+  
+  return vv_mean.addBands(vv_median).addBands(vv_stdDev)
+    .addBands(vh_mean).addBands(vh_median).addBands(vh_stdDev)
+    .addBands(ratio_mean).addBands(ratio_median);
+}
+
+// 地形特征
+var dem = ee.Image("USGS/SRTMGL1_003").clip(region);
+var elevation = dem.rename('elevation');
+var slope = ee.Terrain.slope(dem).rename('slope');
+var aspect = ee.Terrain.aspect(dem).rename('aspect');
+var terrain = elevation.addBands(slope).addBands(aspect);
+
+// -------------------- 主处理函数 --------------------
+function processYear(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = ee.Date.fromYMD(year, 12, 31);
+
+  // Sentinel-2 数据处理
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(region)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']);
+  
+  var s2_mean = s2.mean();
+  var s2_median = s2.median();
+  
+  // 计算植被指数
+  var ndvi = s2_median.normalizedDifference(['B8','B4']).rename('NDVI');
+  var evi = s2_median.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+    {
+      NIR: s2_median.select('B8'),
+      RED: s2_median.select('B4'),
+      BLUE: s2_median.select('B2')
+    }
+  ).rename('EVI');
+  
+  // 计算其他植被指数
+  var ndre = s2_median.normalizedDifference(['B8A', 'B5']).rename('NDRE');
+  var savi = s2_median.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))',
+    {
+      NIR: s2_median.select('B8'),
+      RED: s2_median.select('B4')
+    }
+  ).rename('SAVI');
+
+  // 红边波段
+  var rededge = s2_median.select(['B5','B6','B7','B8A']).rename(['RE1','RE2','RE3','RE4']);
+
+  // GEDI 数据 - 优化处理（移除了强制重投影）
+  var gedi = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+    .filterBounds(region)
+    .filterDate(start, end)
+    .select('rh100')
+    .median()
+    .rename('RH100');
+
+  // Sentinel-1 极化
+  var s1 = getS1(year);
+
+  // 合成所有特征
+  var features = s2_median
+    .addBands(ndvi)
+    .addBands(evi)
+    .addBands(ndre)
+    .addBands(savi)
+    .addBands(rededge)
+    .addBands(terrain)
+    .addBands(gedi)
+    .addBands(s1)
+    .unmask();
+
+  // 提取特征值
+  var samples = features.sampleRegions({
+    collection: allSamples,
+    properties: ['class'],
+    scale: 10,  // 使用Sentinel-2的分辨率
+    tileScale: 4
+  });
+
+  // 返回处理结果
+  return samples.set('year', year);
+}
+
+// 创建年份列表
+var years = ee.List.sequence(startYear, endYear);
+
+// 映射处理函数到每一年
+var annualSamples = years.map(function(year) {
+  return processYear(year);
+});
+
+// 打印关键信息用于调试
+print('研究区域:', region);
+print('样本点集合:', allSamples);
+print('年度样本集合列表:', annualSamples);
+print('年度样本集合大小:', annualSamples.size());
+
+// 安全导出流程 - 服务器端处理
+years.evaluate(function(yearList) {
+  yearList.forEach(function(year) {
+    var samples = ee.FeatureCollection(processYear(year));
+    
+    // 检查样本数量
+    samples.size().evaluate(function(count) {
+      if (count > 0) {
+        print('导出年份:', year, '样本数量:', count);
+        
+        // 创建导出任务
+        Export.table.toDrive({
+          collection: samples,
+          description: 'TreeSpecies_FeatureAnalysis_' + year,
+          folder: 'TreeSpecies_Features',
+          fileFormat: 'CSV'
+        });
+      } else {
+        print('警告: 年份', year, '没有有效样本数据');
+      }
+    });
+  });
+});
